@@ -5,10 +5,20 @@
 // touch the real Question module or write to the filesystem.
 
 import { describe, expect, test } from "bun:test"
-import { Duration, Effect } from "effect"
-import type { MessageID, SessionID } from "../../src/session/schema"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { Deferred, Duration, Effect, Fiber } from "effect"
+import * as TestClock from "effect/testing/TestClock"
+import path from "path"
+import { PartID, type MessageID, type SessionID } from "../../src/session/schema"
 import { KiloSnapshotTrack } from "../../src/kilocode/snapshot/track"
-import { awaitWithTimeout } from "../lib/effect"
+import { KiloPartLifecycle } from "../../src/kilocode/session/part-lifecycle"
+import { AppRuntime } from "../../src/effect/app-runtime"
+import { GlobalBus, type GlobalEvent } from "../../src/bus/global"
+import { InstanceRef } from "../../src/effect/instance-ref"
+import { Session } from "../../src/session/session"
+import { requireInstance, TestInstance } from "../fixture/fixture"
+import { awaitWithTimeout, it } from "../lib/effect"
 
 const SESSION = "ses_test" as SessionID
 const MESSAGE = "msg_test" as MessageID
@@ -63,6 +73,81 @@ const makeHooks = (
   }
   return { hooks, calls }
 }
+
+describe("KiloSnapshotTrack.protect", () => {
+  it.effect("returns at the availability deadline without waiting for cancellation", () =>
+    Effect.gen(function* () {
+      const state = KiloSnapshotTrack.makeState()
+      const started = yield* Deferred.make<void>()
+      const fallback = { hash: "base", files: [] as string[] }
+      let finalized = false
+      const inner = Deferred.succeed(started, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.ensuring(
+          Effect.sync(() => {
+            finalized = true
+          }),
+        ),
+      )
+      const fiber = yield* KiloSnapshotTrack.protect({
+        inner,
+        state,
+        fallback,
+        operation: "patch",
+        timeoutMs: 100,
+      }).pipe(Effect.forkChild)
+
+      yield* Deferred.await(started)
+      yield* TestClock.adjust(100)
+
+      expect(yield* Fiber.join(fiber)).toEqual(fallback)
+      expect(finalized).toBe(false)
+      expect(state.disabledForSession).toBe(true)
+    }),
+  )
+
+  it.effect("bypasses later operations after a deadline opens the directory circuit", () =>
+    Effect.gen(function* () {
+      const state = KiloSnapshotTrack.makeState()
+      const started = yield* Deferred.make<void>()
+      let calls = 0
+      const first = yield* KiloSnapshotTrack.protect({
+        inner: Effect.sync(() => {
+          calls += 1
+        }).pipe(Effect.andThen(Deferred.succeed(started, undefined)), Effect.andThen(Effect.never)),
+        state,
+        fallback: undefined,
+        operation: "track",
+        timeoutMs: 100,
+      }).pipe(Effect.forkChild)
+
+      yield* Deferred.await(started)
+      yield* TestClock.adjust(100)
+      expect(yield* Fiber.join(first)).toBeUndefined()
+
+      const second = yield* KiloSnapshotTrack.protect({
+        inner: Effect.sync(() => {
+          calls += 1
+          return "unexpected"
+        }),
+        state,
+        fallback: undefined,
+        operation: "track",
+      })
+      expect(second).toBeUndefined()
+      expect(calls).toBe(1)
+    }),
+  )
+
+  test("keeps circuit state isolated by directory", () => {
+    const states = KiloSnapshotTrack.makeStates()
+    const first = states("/repo/a")
+    first.disabledForSession = true
+
+    expect(states("/repo/a")).toBe(first)
+    expect(states("/repo/b").disabledForSession).toBe(false)
+  })
+})
 
 describe("KiloSnapshotTrack.wrap", () => {
   test("returns the hash when inner resolves before the timeout", async () => {
@@ -483,6 +568,18 @@ describe("KiloSnapshotTrack.wrap", () => {
 })
 
 describe("KiloSnapshotTrack progress indicator", () => {
+  test("classifies persisted progress as transient", () => {
+    const part = KiloSnapshotTrack.progressPart({
+      sessionID: SESSION,
+      messageID: MESSAGE,
+      partID: PartID.make("prt_test"),
+      text: "arbitrary status",
+    })
+
+    expect(part.synthetic).toBe(true)
+    expect(KiloPartLifecycle.transient(part)).toBe(true)
+  })
+
   // Strip the braille spinner frame (first Unicode codepoint, plus the
   // trailing space) so tests can assert on the stable descriptive text
   // without caring which animation frame landed.
@@ -857,6 +954,115 @@ describe("KiloSnapshotTrack progress indicator", () => {
     }
     // At least two different frames should have been rendered during the run.
     expect(frames.size).toBeGreaterThanOrEqual(2)
+  })
+})
+
+describe("KiloSnapshotTrack default hooks", () => {
+  it.instance(
+    "preserves the instance directory for real session progress events",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const ctx = yield* requireInstance
+        const session = yield* Effect.promise(() =>
+          AppRuntime.runPromise(
+            Session.Service.use((svc) => svc.create({ title: "snapshot progress" })).pipe(
+              Effect.provideService(InstanceRef, ctx),
+            ),
+          ),
+        )
+        const message = yield* Effect.promise(() =>
+          AppRuntime.runPromise(
+            Session.Service.use((svc) =>
+              svc.updateMessage({
+                id: MESSAGE,
+                role: "user",
+                sessionID: session.id,
+                agent: "build",
+                model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") },
+                time: { created: Date.now() },
+              }),
+            ).pipe(Effect.provideService(InstanceRef, ctx)),
+          ),
+        )
+
+        const seen: GlobalEvent[] = []
+        const removed = yield* Deferred.make<void>()
+        const on = (event: GlobalEvent) => {
+          const properties = event.payload?.properties
+          if (properties?.sessionID !== session.id && properties?.part?.sessionID !== session.id) return
+          seen.push(event)
+          if (event.payload?.type === "message.part.removed") Deferred.doneUnsafe(removed, Effect.succeed(undefined))
+        }
+        GlobalBus.on("event", on)
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(async () => {
+            GlobalBus.off("event", on)
+            await AppRuntime.runPromise(
+              Session.Service.use((svc) => svc.remove(session.id)).pipe(Effect.provideService(InstanceRef, ctx)),
+            )
+          }),
+        )
+
+        const result = yield* KiloSnapshotTrack.wrap({
+          inner: slowInner(350, "progress-hash"),
+          state: KiloSnapshotTrack.makeState(),
+          sessionID: session.id,
+          messageID: message.id,
+          timeoutMs: 1_000,
+          progressDelayMs: 1,
+        })
+
+        expect(result).toBe("progress-hash")
+        yield* awaitWithTimeout(Deferred.await(removed), "timed out waiting for snapshot progress removal")
+        const progress = seen.filter(
+          (event) => event.payload?.type === "message.part.updated" || event.payload?.type === "message.part.removed",
+        )
+        expect(progress.some((event) => event.payload?.type === "message.part.updated")).toBe(true)
+        expect(progress.some((event) => event.payload?.type === "message.part.removed")).toBe(true)
+        for (const event of progress) expect(event.directory).toBe(test.directory)
+      }),
+    { git: true },
+  )
+})
+
+describe("KiloSnapshotTrack persistDisable", () => {
+  it.instance(
+    "disable writes snapshot:false to the project config",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const state = KiloSnapshotTrack.makeState()
+        const hooks: KiloSnapshotTrack.Hooks = {
+          ...KiloSnapshotTrack.defaultHooks,
+          async ask() {
+            return "disable"
+          },
+          async startProgress() {},
+          async updateProgress() {},
+          async endProgress() {},
+        }
+
+        yield* KiloSnapshotTrack.wrap({
+          inner: hangInner(),
+          state,
+          sessionID: SESSION,
+          messageID: MESSAGE,
+          hooks,
+          timeoutMs: 10,
+          progressDelayMs: 2,
+        })
+
+        const file = path.join(test.directory, ".kilo", "kilo.jsonc")
+        const text = yield* Effect.tryPromise(() => Bun.file(file).text())
+        expect(JSON.parse(text).snapshot).toBe(false)
+        expect(state.disabledForSession).toBe(true)
+      }),
+    { git: true },
+  )
+
+  test("persistDisable without instance context does not throw", async () => {
+    await KiloSnapshotTrack.defaultHooks.persistDisable()
   })
 })
 
